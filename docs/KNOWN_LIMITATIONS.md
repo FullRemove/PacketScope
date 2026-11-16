@@ -1,0 +1,7 @@
+# PacketScope Known Limitations & Capacity Notes
+
+1. **Encrypted Traffic & TLS 1.3 ECH**: When traffic uses Encrypted Client Hello (ECH) or lacks plaintext DNS/TLS SNI metadata, PacketScope classifies the protocol as `TLS` or `QUIC` and leaves application classification as `UNCLASSIFIED` rather than guessing.
+2. **Single-Host Capture Scope**: A Windows capture agent running on an endpoint workstation NIC sees only traffic sent to/from that workstation and local broadcast/multicast frames. Subnet-wide visibility requires a SPAN/mirror port or gateway deployment.
+3. **GeoIP Precision & Rate Limits**: Public IP geolocation relies on cached RIR/IP intelligence (`ipwho.is` / `ip-api.com`, max 40 uncached lookups/minute, 24h cache TTL). Coordinates represent approximate ISP/network registration regions, never exact user locations.
+4. **Runtime Database Mode**: In this cloud preview container where external PostgreSQL is not provisioned, the live server persists relational records in Node 22's WAL-mode SQLite engine (`data/packetscope.db`) alongside Firebase Auth/Firestore rules, while `db/migrations/0001_initial_postgresql.sql` provides the complete PostgreSQL DDL for dedicated PostgreSQL clusters.
+5. **Windows Agent Verification**: The PowerShell 5.1+ capture agent (`agent/PacketScope-Agent.ps1`) requires Windows 10/11 with Wireshark 4.x (`tshark.exe`) and Npcap installed and cannot execute Npcap live capture inside the Linux container sandbox.

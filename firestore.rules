@@ -1,0 +1,145 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global safety net: deny everything by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isOrgMember(orgId) {
+      return isSignedIn() && exists(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid));
+    }
+
+    function isOrgAdmin(orgId) {
+      return isOrgMember(orgId) &&
+        get(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid)).data.role in ['owner', 'admin'];
+    }
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'displayName', 'activeOrgId', 'updatedAt']) &&
+        data.uid is string && data.uid == request.auth.uid && data.uid.size() <= 128 &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
+        (!('activeOrgId' in data) || isValidId(data.activeOrgId)) &&
+        data.updatedAt is timestamp && data.updatedAt == request.time;
+    }
+
+    function isValidOrganization(data) {
+      return data.keys().hasAll(['id', 'name', 'ownerUid', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'name', 'ownerUid', 'createdAt']) &&
+        isValidId(data.id) &&
+        data.name is string && data.name.size() >= 2 && data.name.size() <= 120 &&
+        data.ownerUid is string && data.ownerUid.size() <= 128 &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidMembership(data, orgId) {
+      return data.keys().hasAll(['uid', 'organizationId', 'role', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'organizationId', 'role', 'createdAt']) &&
+        isValidId(data.uid) &&
+        data.organizationId is string && data.organizationId == orgId &&
+        data.role in ['owner', 'admin', 'analyst', 'viewer'] &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidSensorSummary(data, orgId) {
+      return data.keys().hasAll(['id', 'organizationId', 'name', 'status', 'createdBy', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'organizationId', 'name', 'status', 'createdBy', 'updatedAt']) &&
+        isValidId(data.id) &&
+        data.organizationId is string && data.organizationId == orgId &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        data.status in ['online', 'offline', 'warning', 'error', 'paused'] &&
+        data.createdBy is string && data.createdBy.size() <= 128 &&
+        data.updatedAt is timestamp && data.updatedAt == request.time;
+    }
+
+    // Operator profile isolated strictly to owning UID
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+      allow list: if false;
+      allow create: if isVerified() && isValidId(userId) && request.auth.uid == userId && isValidUserProfile(incoming());
+      allow update: if isVerified() && isValidId(userId) && request.auth.uid == userId &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'activeOrgId', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // Multi-tenant organizations
+    match /organizations/{orgId} {
+      allow get: if isValidId(orgId) && isOrgMember(orgId);
+      allow list: if isSignedIn() && existing().ownerUid == request.auth.uid;
+      allow create: if isVerified() && isValidId(orgId) &&
+        isValidOrganization(incoming()) &&
+        incoming().id == orgId &&
+        incoming().ownerUid == request.auth.uid &&
+        incoming().createdAt == request.time;
+      allow update: if isVerified() && isValidId(orgId) && isOrgAdmin(orgId) &&
+        isValidOrganization(incoming()) &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['name']);
+      allow delete: if false;
+
+      match /members/{memberId} {
+        allow get: if isValidId(orgId) && isValidId(memberId) && (request.auth.uid == memberId || isOrgMember(orgId));
+        allow list: if isValidId(orgId) && isOrgMember(orgId);
+        allow create: if isVerified() && isValidId(orgId) && isValidId(memberId) &&
+          isValidMembership(incoming(), orgId) &&
+          incoming().uid == memberId &&
+          incoming().createdAt == request.time &&
+          (
+            (request.auth.uid == memberId && incoming().role == 'owner' &&
+              getAfter(/databases/$(database)/documents/organizations/$(orgId)).data.ownerUid == request.auth.uid) ||
+            isOrgAdmin(orgId)
+          );
+        allow update: if isVerified() && isValidId(orgId) && isValidId(memberId) && isOrgAdmin(orgId) &&
+          isValidMembership(incoming(), orgId) &&
+          incoming().uid == existing().uid &&
+          incoming().organizationId == existing().organizationId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['role']);
+        allow delete: if isVerified() && isValidId(orgId) && isValidId(memberId) && isOrgAdmin(orgId) &&
+          memberId != get(/databases/$(database)/documents/organizations/$(orgId)).data.ownerUid;
+      }
+
+      match /sensors/{sensorId} {
+        allow get: if isValidId(orgId) && isValidId(sensorId) && isOrgMember(orgId);
+        allow list: if isValidId(orgId) && isOrgMember(orgId);
+        allow create: if isVerified() && isValidId(orgId) && isValidId(sensorId) && isOrgAdmin(orgId) &&
+          isValidSensorSummary(incoming(), orgId) &&
+          incoming().id == sensorId &&
+          incoming().createdBy == request.auth.uid;
+        allow update: if isVerified() && isValidId(orgId) && isValidId(sensorId) && isOrgAdmin(orgId) &&
+          isValidSensorSummary(incoming(), orgId) &&
+          incoming().id == existing().id &&
+          incoming().organizationId == existing().organizationId &&
+          incoming().createdBy == existing().createdBy &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['name', 'status', 'updatedAt']);
+        allow delete: if isVerified() && isValidId(orgId) && isValidId(sensorId) && isOrgAdmin(orgId);
+      }
+    }
+  }
+}
